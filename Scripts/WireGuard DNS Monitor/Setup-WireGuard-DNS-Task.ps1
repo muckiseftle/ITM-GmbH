@@ -368,3 +368,4 @@ Write-Host "Logs anzeigen:" -ForegroundColor Yellow
 Write-Host "  Get-Content `"`$env:TEMP\wg_dns_check_`$(Get-Date -Format 'yyyyMMdd').log`" -Tail 50" -ForegroundColor Gray
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+pause
