@@ -8,12 +8,9 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 if (-not $IsAdmin) {
     Write-Host "Starte Script mit Administratorrechten..." -ForegroundColor Yellow
 
-    # Wenn das Script NICHT aus einer Datei läuft (z.B. irm|iex), ist $PSCommandPath leer.
-    # Dann speichern wir den aktuellen Script-Inhalt in eine Temp-Datei und starten die.
     $tempFile = Join-Path $env:TEMP "Setup-WireGuard-DNS-Task.elevated.ps1"
 
     if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path $PSCommandPath)) {
-        # Content des aktuell laufenden Scripts aus dem Callstack holen (funktioniert bei irm|iex)
         $scriptText = (Get-Variable MyInvocation -Scope 0).Value.MyCommand.ScriptBlock.ToString()
         Set-Content -Path $tempFile -Value $scriptText -Encoding UTF8 -Force
 
@@ -21,7 +18,6 @@ if (-not $IsAdmin) {
         exit
     }
 
-    # Normaler Fall: Script läuft aus Datei
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     exit
 }
@@ -56,12 +52,11 @@ $baseDir   = "C:\ITM\Scripts"
 $checkPath = Join-Path $baseDir "WG-Tunnel-ping.ps1"
 $runPath   = Join-Path $baseDir "WG-Runner.ps1"
 
-# --- Ordner anlegen ---
 if (-not (Test-Path $baseDir)) {
   New-Item -Path $baseDir -ItemType Directory -Force | Out-Null
 }
 
-# --- Inhalt: WG-Tunnel-ping.ps1 (nutzt feste DNS IP und festen Tunnel) ---
+# --- Inhalt: WG-Tunnel-ping.ps1 ---
 $checkScript = @"
 param(
   [int]`$Log = 0
@@ -183,6 +178,24 @@ function Restart-WireGuardService([string]`$TunnelName){
   }
 }
 
+function Test-PingByOutput([string]`$Ip){
+  # "Normaler" ping wie in CMD (4 Echo Requests), Output wird ausgewertet
+  # Erfolg, wenn irgendwo "TTL=" vorkommt (sprachunabhängig)
+  try {
+    `$out = & ping.exe `$Ip 2>&1 | Out-String
+  } catch {
+    `$out = "`$($_.Exception.Message)"
+  }
+
+  # optional ins Log schreiben (debug)
+  OutLog ("PING-OUTPUT: " + (`$out -replace "`r","" -replace "`n"," | ").Trim())
+
+  if(`$out -match "TTL="){
+    return `$true
+  }
+  return `$false
+}
+
 # ================== START ==================
 OutLog "Start"
 OutLog "TunnelName=`$TunnelNameFixed"
@@ -190,19 +203,8 @@ OutLog "DnsIp=`$DnsIpFixed"
 OutLog "LogFile=`$logPath"
 
 # ================== PING ==================
-OutLog "Ping `$DnsIpFixed (4 Versuche)"
-`$ok = `$true
-
-for (`$i=1; `$i -le 4; `$i++) {
-  ping.exe -n 1 -w 1000 `$DnsIpFixed > `$null
-  if (`$LASTEXITCODE -eq 0) {
-    OutLog "Ping `$i/4 OK"
-  } else {
-    OutLog "Ping `$i/4 FAIL"
-    `$ok = `$false
-    break
-  }
-}
+OutLog "Ping (normal) `$DnsIpFixed"
+`$ok = Test-PingByOutput -Ip `$DnsIpFixed
 
 if (`$ok) {
   OutLog "Result=1 DNS erreichbar"
@@ -246,7 +248,6 @@ Set-Content -Path $runPath -Value $runnerScript -Encoding UTF8 -Force
 # --- Scheduled Task erstellen ---
 $taskName = "ITM-WireGuard-DNS-Check-30s"
 
-# Wenn Task existiert -> löschen
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
