@@ -1,4 +1,9 @@
-# ITM – WireGuard DNS Monitor (30s)
+<p align="center">
+  <img src="../../assets/logo-light.png#gh-light-mode-only" alt="ITM GmbH" width="150">
+  <img src="../../assets/logo-dark.png#gh-dark-mode-only"  alt="ITM GmbH" width="150">
+</p>
+
+# ITM GmbH – WireGuard DNS Monitor
 
 Dieses Setup erstellt ein kleines Monitoring, das eine feste DNS-IP per Ping prüft.  
 Wenn der Ping fehlschlägt, wird der konfigurierte WireGuard-Tunnel **automatisch als Tunnel-Service installiert** und **gestartet**.
@@ -47,7 +52,9 @@ Wenn der Ping fehlschlägt, wird der konfigurierte WireGuard-Tunnel **automatisc
   - `C:\ITM\Scripts\WG-Runner.ps1`
 
 ### Logs
-- `%TEMP%\wg_dns_check_YYYYMMDD.log`
+- Werden über im Script `WG-Tunnel-ping.ps1` über `$Log = 1` ein / ausgeschaltet (Default 0)
+    - `%TEMP%\wg_dns_check_YYYYMMDD.log`
+
 
 ---
 
