@@ -1,7 +1,6 @@
 # Setup-WireGuard-DNS-Task.ps1
 # Erstellt C:\ITM\Scripts\WG-Tunnel-ping.ps1 + WG-Runner.ps1 und legt geplante Aufgabe als SYSTEM an
 
-
 # ================== SELF-ELEVATION (robust for irm|iex) ==================
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -27,8 +26,6 @@ if (-not $IsAdmin) {
     exit
 }
 # ========================================================================
-
-
 
 $ErrorActionPreference = "Stop"
 
@@ -105,39 +102,84 @@ function Get-TunnelConfigPath([string]`$TunnelName){
   return `$null
 }
 
-function Ensure-TunnelServiceRunning([string]`$TunnelName){
+function Wait-ServiceStatus([string]`$Name, [string]`$Desired, [int]`$TimeoutSec = 15){
+  `$sw = [Diagnostics.Stopwatch]::StartNew()
+  while(`$sw.Elapsed.TotalSeconds -lt `$TimeoutSec){
+    `$s = Get-Service -Name `$Name -ErrorAction SilentlyContinue
+    if(`$s -and `$s.Status.ToString() -eq `$Desired){ return `$true }
+    Start-Sleep -Milliseconds 300
+  }
+  return `$false
+}
+
+function Ensure-ServiceExistsOrInstall([string]`$TunnelName){
+  `$svcName = "WireGuardTunnel`$" + `$TunnelName
+  `$svc = Get-Service -Name `$svcName -ErrorAction SilentlyContinue
+  if(`$svc){
+    OutLog "Dienst existiert: `$svcName (Status=`$(`$svc.Status))"
+    return `$true
+  }
+
+  OutLog "Dienst existiert NICHT: `$svcName → installiere Tunnel-Service"
+
   `$wgExe = Get-WireGuardExePath
   if(-not `$wgExe){
-    OutLog "WireGuard EXE nicht gefunden"
-    return
+    OutLog "WireGuard EXE nicht gefunden → Abbruch"
+    return `$false
   }
 
   `$cfgFile = Get-TunnelConfigPath `$TunnelName
   if(-not `$cfgFile){
-    OutLog "Config-Datei nicht gefunden für Tunnel `$TunnelName"
-    return
+    OutLog "Config-Datei nicht gefunden für Tunnel '`$TunnelName' → Abbruch"
+    return `$false
   }
 
-  `$svcName = "WireGuardTunnel`$" + `$TunnelName
+  OutLog "CMD: `$wgExe /installtunnelservice `$cfgFile"
+  & `$wgExe /installtunnelservice "`$cfgFile" | Out-Null
+
+  Start-Sleep -Seconds 1
   `$svc = Get-Service -Name `$svcName -ErrorAction SilentlyContinue
-
   if(`$svc){
-    OutLog "Dienst existiert: `$svcName (Status=`$(`$svc.Status))"
-    if(`$svc.Status -ne "Running"){
-      OutLog "Starte Dienst `$svcName"
-      Start-Service -Name `$svcName -ErrorAction SilentlyContinue
-    }
+    OutLog "Dienst nach Installation vorhanden: `$svcName (Status=`$(`$svc.Status))"
+    return `$true
+  } else {
+    OutLog "Dienst konnte nicht installiert werden (Service nicht sichtbar) → Abbruch"
+    return `$false
   }
-  else {
-    OutLog "Dienst existiert nicht → installiere Tunnel-Service"
-    OutLog "CMD: `$wgExe /installtunnelservice `$cfgFile"
-    & `$wgExe /installtunnelservice "`$cfgFile" | Out-Null
-    Start-Service -Name `$svcName -ErrorAction SilentlyContinue
+}
+
+function Restart-WireGuardService([string]`$TunnelName){
+  `$svcName = "WireGuardTunnel`$" + `$TunnelName
+
+  `$svc = Get-Service -Name `$svcName -ErrorAction SilentlyContinue
+  if(-not `$svc){
+    OutLog "Restart angefordert, aber Dienst fehlt: `$svcName"
+    return `$false
   }
 
-  `$svc2 = Get-Service -Name `$svcName -ErrorAction SilentlyContinue
-  if(`$svc2){
-    OutLog "Dienststatus nach Aktion: `$(`$svc2.Status)"
+  OutLog "Neustart Dienst: `$svcName (aktuell=`$(`$svc.Status))"
+
+  try {
+    if(`$svc.Status -eq 'Running'){
+      Stop-Service -Name `$svcName -Force -ErrorAction SilentlyContinue
+      if(-not (Wait-ServiceStatus -Name `$svcName -Desired "Stopped" -TimeoutSec 20)){
+        OutLog "Dienst stoppt nicht sauber innerhalb Timeout (20s) → weiter mit Start"
+      } else {
+        OutLog "Dienst gestoppt"
+      }
+    }
+
+    Start-Service -Name `$svcName -ErrorAction SilentlyContinue
+    if(Wait-ServiceStatus -Name `$svcName -Desired "Running" -TimeoutSec 20){
+      OutLog "Dienst läuft wieder"
+      return `$true
+    } else {
+      OutLog "Dienst startet nicht sauber innerhalb Timeout (20s)"
+      return `$false
+    }
+  } catch {
+    OutLog "Fehler beim Neustart: `$(`$_.Exception.Message)"
+    return `$false
   }
 }
 
@@ -168,9 +210,15 @@ if (`$ok) {
   exit 0
 }
 
-# ================== DNS DOWN → TUNNEL START ==================
-OutLog "DNS nicht erreichbar → Tunnel starten"
-Ensure-TunnelServiceRunning -TunnelName `$TunnelNameFixed
+# ================== PING FAIL → SERVICE CHECK/INSTALL/RESTART ==================
+OutLog "DNS nicht erreichbar → Dienst prüfen / installieren / neustarten"
+
+if(Ensure-ServiceExistsOrInstall -TunnelName `$TunnelNameFixed){
+  `$r = Restart-WireGuardService -TunnelName `$TunnelNameFixed
+  OutLog "RestartResult=`$r"
+} else {
+  OutLog "Service konnte nicht sichergestellt werden → kein Neustart möglich"
+}
 
 OutLog "Result=0 DNS offline"
 Write-Output 0
@@ -218,7 +266,6 @@ $settings = New-ScheduledTaskSettingsSet `
   -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-
 Start-ScheduledTask -TaskName $taskName
 
 Write-Host ""
