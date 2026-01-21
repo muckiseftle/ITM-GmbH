@@ -2,18 +2,31 @@
 # Erstellt C:\ITM\Scripts\WG-Tunnel-ping.ps1 + WG-Runner.ps1 und legt geplante Aufgabe als SYSTEM an
 
 
-# ================== SELF-ELEVATION ==================
-if (-not ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+# ================== SELF-ELEVATION (robust for irm|iex) ==================
+$IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+if (-not $IsAdmin) {
     Write-Host "Starte Script mit Administratorrechten..." -ForegroundColor Yellow
 
-    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $args
+    # Wenn das Script NICHT aus einer Datei läuft (z.B. irm|iex), ist $PSCommandPath leer.
+    # Dann speichern wir den aktuellen Script-Inhalt in eine Temp-Datei und starten die.
+    $tempFile = Join-Path $env:TEMP "Setup-WireGuard-DNS-Task.elevated.ps1"
+
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path $PSCommandPath)) {
+        # Content des aktuell laufenden Scripts aus dem Callstack holen (funktioniert bei irm|iex)
+        $scriptText = (Get-Variable MyInvocation -Scope 0).Value.MyCommand.ScriptBlock.ToString()
+        Set-Content -Path $tempFile -Value $scriptText -Encoding UTF8 -Force
+
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tempFile`""
+        exit
+    }
+
+    # Normaler Fall: Script läuft aus Datei
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     exit
 }
-# ====================================================
+# ========================================================================
 
 
 
