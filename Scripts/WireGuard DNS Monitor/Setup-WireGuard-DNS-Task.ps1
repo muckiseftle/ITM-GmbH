@@ -1,5 +1,5 @@
 # Setup-WireGuard-DNS-Task.ps1
-# Erstellt C:\ITM\Scripts\WG-Tunnel-ping.ps1 + WG-Runner.ps1 und legt geplante Aufgabe als SYSTEM an
+# Erstellt C:\ITM\Scripts\WG-Tunnel-ping.ps1 und legt geplante Aufgabe als SYSTEM an
 
 # ================== SELF-ELEVATION (robust for irm|iex) ==================
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -14,11 +14,16 @@ if (-not $IsAdmin) {
         $scriptText = (Get-Variable MyInvocation -Scope 0).Value.MyCommand.ScriptBlock.ToString()
         Set-Content -Path $tempFile -Value $scriptText -Encoding UTF8 -Force
 
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tempFile`""
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tempFile`"" -Wait
+        
+        # Cleanup temp file
+        if (Test-Path $tempFile) {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        }
         exit
     }
 
-    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Wait
     exit
 }
 # ========================================================================
@@ -56,16 +61,19 @@ if (-not (Test-Path $baseDir)) {
   New-Item -Path $baseDir -ItemType Directory -Force | Out-Null
 }
 
-# --- Inhalt: WG-Tunnel-ping.ps1 ---
+# --- Inhalt: WG-Tunnel-ping.ps1 (VERBESSERT) ---
 $checkScript = @"
 param(
   [int]`$Log = 0
 )
 
-# ================== FESTE PARAMETER ==================
-`$TunnelNameFixed = "$TunnelNameFixed"        # ohne .conf / .conf.dpapi
-`$DnsIpFixed      = "$DnsIpFixed"             # DNS-IP für Ping
-# =====================================================
+# ================== KONFIGURATION ==================
+`$TunnelNameFixed     = "$TunnelNameFixed"        # ohne .conf / .conf.dpapi
+`$DnsIpFixed          = "$DnsIpFixed"             # DNS-IP für Ping
+`$PingTimeoutSeconds  = 2                         # Ping-Timeout
+`$ServiceTimeoutSec   = 20                        # Service Start/Stop Timeout
+`$LogRetentionDays    = 7                         # Log-Dateien älter als X Tage löschen
+# ===================================================
 
 `$logPath = Join-Path `$env:TEMP ("wg_dns_check_" + (Get-Date -Format "yyyyMMdd") + ".log")
 
@@ -73,7 +81,18 @@ function OutLog([string]`$m){
   `$line = "[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + `$m
   Write-Host `$line
   if(`$Log -eq 1){
-    Add-Content -Path `$logPath -Value `$line -Encoding UTF8
+    Add-Content -Path `$logPath -Value `$line -Encoding UTF8 -ErrorAction SilentlyContinue
+  }
+}
+
+function Cleanup-OldLogs {
+  try {
+    `$maxAge = (Get-Date).AddDays(-`$LogRetentionDays)
+    Get-ChildItem "`$env:TEMP\wg_dns_check_*.log" -ErrorAction SilentlyContinue | 
+      Where-Object {`$_.LastWriteTime -lt `$maxAge} | 
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  } catch {
+    # Fehler beim Cleanup ignorieren
   }
 }
 
@@ -130,7 +149,12 @@ function Ensure-ServiceExistsOrInstall([string]`$TunnelName){
   }
 
   OutLog "CMD: `$wgExe /installtunnelservice `$cfgFile"
-  & `$wgExe /installtunnelservice "`$cfgFile" | Out-Null
+  try {
+    & `$wgExe /installtunnelservice "`$cfgFile" | Out-Null
+  } catch {
+    OutLog "FEHLER bei Installation: `$(`$_.Exception.Message)"
+    return `$false
+  }
 
   Start-Sleep -Seconds 1
   `$svc = Get-Service -Name `$svcName -ErrorAction SilentlyContinue
@@ -156,38 +180,48 @@ function Restart-WireGuardService([string]`$TunnelName){
 
   try {
     if(`$svc.Status -eq 'Running'){
-      Stop-Service -Name `$svcName -Force -ErrorAction SilentlyContinue
-      if(-not (Wait-ServiceStatus -Name `$svcName -Desired "Stopped" -TimeoutSec 20)){
-        OutLog "Dienst stoppt nicht sauber innerhalb Timeout (20s) → weiter mit Start"
+      Stop-Service -Name `$svcName -Force -ErrorAction Stop
+      if(-not (Wait-ServiceStatus -Name `$svcName -Desired "Stopped" -TimeoutSec `$ServiceTimeoutSec)){
+        OutLog "WARNUNG: Dienst stoppt nicht sauber innerhalb Timeout (`$ServiceTimeoutSec`s) → weiter mit Start"
       } else {
         OutLog "Dienst gestoppt"
       }
     }
 
-    Start-Service -Name `$svcName -ErrorAction SilentlyContinue
-    if(Wait-ServiceStatus -Name `$svcName -Desired "Running" -TimeoutSec 20){
+    Start-Service -Name `$svcName -ErrorAction Stop
+    if(Wait-ServiceStatus -Name `$svcName -Desired "Running" -TimeoutSec `$ServiceTimeoutSec){
       OutLog "Dienst läuft wieder"
       return `$true
     } else {
-      OutLog "Dienst startet nicht sauber innerhalb Timeout (20s)"
+      OutLog "WARNUNG: Dienst startet nicht sauber innerhalb Timeout (`$ServiceTimeoutSec`s)"
       return `$false
     }
   } catch {
-    OutLog "Fehler beim Neustart: `$(`$_.Exception.Message)"
+    OutLog "FEHLER beim Neustart: `$(`$_.Exception.Message)"
+    return `$false
+  }
+}
+
+function Test-PingFast([string]`$Ip){
+  # Nutzt eingebautes Test-Connection (1 Paket, schneller)
+  try {
+    return (Test-Connection -ComputerName `$Ip -Count 1 -Quiet -TimeoutSeconds `$PingTimeoutSeconds -ErrorAction Stop)
+  } catch {
+    OutLog "FEHLER bei Test-Connection: `$(`$_.Exception.Message)"
     return `$false
   }
 }
 
 function Test-PingByOutput([string]`$Ip){
-  # "Normaler" ping wie in CMD (4 Echo Requests), Output wird ausgewertet
+  # Fallback: "Normaler" ping wie in CMD (1 Echo Request), Output wird ausgewertet
   # Erfolg, wenn irgendwo "TTL=" vorkommt (sprachunabhängig)
+  `$timeoutMs = `$PingTimeoutSeconds * 1000
   try {
-    `$out = & ping.exe `$Ip 2>&1 | Out-String
+    `$out = & ping.exe -n 1 -w `$timeoutMs `$Ip 2>&1 | Out-String
   } catch {
-    `$out = "`$($_.Exception.Message)"
+    `$out = "`$(`$_.Exception.Message)"
   }
 
-  # optional ins Log schreiben (debug)
   OutLog ("PING-OUTPUT: " + (`$out -replace "`r","" -replace "`n"," | ").Trim())
 
   if(`$out -match "TTL="){
@@ -197,17 +231,28 @@ function Test-PingByOutput([string]`$Ip){
 }
 
 # ================== START ==================
-OutLog "Start"
+Cleanup-OldLogs
+
+OutLog "=========================================="
+OutLog "Start WG-DNS-Check"
 OutLog "TunnelName=`$TunnelNameFixed"
 OutLog "DnsIp=`$DnsIpFixed"
+OutLog "PingTimeout=`$PingTimeoutSeconds`s"
 OutLog "LogFile=`$logPath"
 
-# ================== PING ==================
-OutLog "Ping (normal) `$DnsIpFixed"
-`$ok = Test-PingByOutput -Ip `$DnsIpFixed
+# ================== PING (PRIMÄR) ==================
+OutLog "Ping (Test-Connection) `$DnsIpFixed"
+`$ok = Test-PingFast -Ip `$DnsIpFixed
+
+# ================== PING FALLBACK ==================
+if (-not `$ok) {
+  OutLog "Test-Connection fehlgeschlagen → Fallback zu ping.exe"
+  `$ok = Test-PingByOutput -Ip `$DnsIpFixed
+}
 
 if (`$ok) {
   OutLog "Result=1 DNS erreichbar"
+  OutLog "=========================================="
   Write-Output 1
   exit 0
 }
@@ -223,36 +268,62 @@ if(Ensure-ServiceExistsOrInstall -TunnelName `$TunnelNameFixed){
 }
 
 OutLog "Result=0 DNS offline"
+OutLog "=========================================="
 Write-Output 0
 "@
 
 Set-Content -Path $checkPath -Value $checkScript -Encoding UTF8 -Force
 
-# --- Inhalt: WG-Runner.ps1 (führt alle 30s das Check-Script aus) ---
+# --- Inhalt: WG-Runner.ps1 (optimiert mit Mutex gegen Race Conditions) ---
 $runnerScript = @"
 # Läuft dauerhaft und startet alle 30 Sekunden das Check-Script
-`$check = "$checkPath"
+# Mutex verhindert parallele Ausführungen
+
+`$checkScript = "$checkPath"
+`$intervalSeconds = 30
+
+`$mutexName = "Global\WG-DNS-Check-Mutex"
+`$mutex = New-Object System.Threading.Mutex(`$false, `$mutexName)
+
+Write-Host "[Runner] Gestartet. Interval=`$intervalSeconds`s, Mutex=`$mutexName"
 
 while (`$true) {
+  `$acquired = `$false
   try {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "`$check" -Log 1 | Out-Null
+    # Versuche Mutex zu bekommen (non-blocking)
+    `$acquired = `$mutex.WaitOne(0)
+    
+    if (`$acquired) {
+      try {
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File "`$checkScript" -Log 1 | Out-Null
+      } catch {
+        Write-Host "[Runner] Fehler beim Ausführen: `$(`$_.Exception.Message)"
+      } finally {
+        `$mutex.ReleaseMutex()
+      }
+    } else {
+      Write-Host "[Runner] Check läuft bereits, überspringe..."
+    }
   } catch {
-    # nicht sterben, einfach weiter
+    Write-Host "[Runner] Mutex-Fehler: `$(`$_.Exception.Message)"
   }
-  Start-Sleep -Seconds 30
+  
+  Start-Sleep -Seconds `$intervalSeconds
 }
 "@
 
 Set-Content -Path $runPath -Value $runnerScript -Encoding UTF8 -Force
 
-# --- Scheduled Task erstellen ---
+# --- Scheduled Task erstellen (mit Runner für 30s-Intervall) ---
 $taskName = "ITM-WireGuard-DNS-Check-30s"
 
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
 
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runPath`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runPath`""
+
+# Trigger: Bei Systemstart
 $trigger = New-ScheduledTaskTrigger -AtStartup
 
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -270,12 +341,30 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 Start-ScheduledTask -TaskName $taskName
 
 Write-Host ""
-Write-Host "FERTIG." -ForegroundColor Green
-Write-Host "Script gespeichert: $checkPath"
-Write-Host "Runner gespeichert: $runPath"
-Write-Host "Aufgabe erstellt:  $taskName (SYSTEM, Highest, Start at boot, loop alle 30s)"
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "INSTALLATION ABGESCHLOSSEN" -ForegroundColor Green
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Status prüfen:"
-Write-Host "  Get-ScheduledTask -TaskName `"$taskName`" | Get-ScheduledTaskInfo"
-Write-Host "Dienst prüfen:"
-Write-Host "  Get-Service `"WireGuardTunnel`$$TunnelNameFixed`""
+Write-Host "Scripts gespeichert:" -ForegroundColor White
+Write-Host "  Check-Script:      $checkPath" -ForegroundColor Gray
+Write-Host "  Runner-Script:     $runPath" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Aufgabe erstellt:      $taskName" -ForegroundColor White
+Write-Host ""
+Write-Host "Konfiguration:" -ForegroundColor Yellow
+Write-Host "  - Benutzer:          SYSTEM (Höchste Rechte)" -ForegroundColor Gray
+Write-Host "  - Start:             Bei Systemstart" -ForegroundColor Gray
+Write-Host "  - Intervall:         Alle 30 Sekunden (via Runner)" -ForegroundColor Gray
+Write-Host "  - Parallele Läufe:   Verhindert (Mutex)" -ForegroundColor Gray
+Write-Host "  - Fenster:           Versteckt" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Status prüfen:" -ForegroundColor Yellow
+Write-Host "  Get-ScheduledTask -TaskName `"$taskName`" | Get-ScheduledTaskInfo" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Dienst prüfen:" -ForegroundColor Yellow
+Write-Host "  Get-Service `"WireGuardTunnel`$TunnelNameFixed`"" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Logs anzeigen:" -ForegroundColor Yellow
+Write-Host "  Get-Content `"`$env:TEMP\wg_dns_check_`$(Get-Date -Format 'yyyyMMdd').log`" -Tail 50" -ForegroundColor Gray
+Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
