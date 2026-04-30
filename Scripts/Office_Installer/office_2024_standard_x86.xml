@@ -1,0 +1,12 @@
+<Configuration>
+  <Add OfficeClientEdition="32" Channel="PerpetualVL2024">
+    <Product ID="Standard2024Volume">
+      <Language ID="de-de" />
+    </Product>
+  </Add>
+  <RemoveMSI />
+  <Updates Enabled="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+  <Property Name="AUTOACTIVATE" Value="1" />
+</Configuration>
